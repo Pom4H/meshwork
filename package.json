@@ -1,0 +1,16 @@
+{
+  "name": "meshwork",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "broker": "bun src/cli.ts broker",
+    "worker": "bun src/cli.ts worker",
+    "run": "bun src/cli.ts run",
+    "check": "bunx tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "latest"
+  }
+}
