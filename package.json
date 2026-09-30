@@ -7,7 +7,8 @@
     "broker": "bun src/cli.ts broker",
     "worker": "bun src/cli.ts worker",
     "run": "bun src/cli.ts run",
-    "check": "bunx tsc --noEmit"
+    "check": "bunx tsc --noEmit",
+    "test": "bun test"
   },
   "devDependencies": {
     "@types/bun": "latest",
