@@ -14,3 +14,4 @@ jobs:
           bun-version: latest
       - run: bun install --frozen-lockfile=false
       - run: bun run check
+      - run: bun test

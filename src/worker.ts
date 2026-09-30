@@ -6,7 +6,15 @@ import type {
   WorkerToBroker,
 } from "./protocol";
 
-export type CapabilityHandler = (input: JsonValue) => JsonValue | Promise<JsonValue>;
+export type CapabilityContext = {
+  taskId: string;
+  attemptId: string;
+};
+
+export type CapabilityHandler = (
+  input: JsonValue,
+  context: CapabilityContext,
+) => JsonValue | Promise<JsonValue>;
 
 export type WorkerOptions = {
   brokerUrl?: string;
@@ -38,6 +46,9 @@ export function startWorker(options: WorkerOptions = {}) {
   let socket: WebSocket | undefined;
   let heartbeat: Timer | undefined;
   let stopped = false;
+  let active:
+    | { taskId: string; attemptId: string }
+    | undefined;
 
   const send = (message: WorkerToBroker) => {
     if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
@@ -49,10 +60,14 @@ export function startWorker(options: WorkerOptions = {}) {
 
     socket.addEventListener("open", () => {
       send({ type: "worker.hello", worker });
-      heartbeat = setInterval(
-        () => send({ type: "worker.heartbeat", workerId: worker.id }),
-        5_000,
-      );
+      heartbeat = setInterval(() => {
+        send({
+          type: "worker.heartbeat",
+          workerId: worker.id,
+          taskId: active?.taskId,
+          attemptId: active?.attemptId,
+        });
+      }, 5_000);
       console.log(
         `meshwork worker ${worker.name} connected (${worker.capabilities.join(", ")})`,
       );
@@ -66,32 +81,72 @@ export function startWorker(options: WorkerOptions = {}) {
         return;
       }
 
-      if (message.type !== "task.assign") return;
+      if (message.type === "task.cancel") {
+        if (
+          active?.taskId === message.taskId &&
+          active.attemptId === message.attemptId
+        ) {
+          active = undefined;
+        }
+        return;
+      }
+
+      if (active) return;
       const handler = handlers[message.task.capability];
       if (!handler) {
         send({
           type: "task.error",
           taskId: message.task.id,
+          attemptId: message.attemptId,
           error: `capability not available: ${message.task.capability}`,
         });
         return;
       }
 
+      active = {
+        taskId: message.task.id,
+        attemptId: message.attemptId,
+      };
+
       try {
-        const output = await handler(message.task.input);
-        send({ type: "task.result", taskId: message.task.id, output });
+        const output = await handler(message.task.input, active);
+        if (
+          active?.taskId === message.task.id &&
+          active.attemptId === message.attemptId
+        ) {
+          send({
+            type: "task.result",
+            taskId: message.task.id,
+            attemptId: message.attemptId,
+            output,
+          });
+        }
       } catch (error) {
-        send({
-          type: "task.error",
-          taskId: message.task.id,
-          error: error instanceof Error ? error.message : String(error),
-        });
+        if (
+          active?.taskId === message.task.id &&
+          active.attemptId === message.attemptId
+        ) {
+          send({
+            type: "task.error",
+            taskId: message.task.id,
+            attemptId: message.attemptId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      } finally {
+        if (
+          active?.taskId === message.task.id &&
+          active.attemptId === message.attemptId
+        ) {
+          active = undefined;
+        }
       }
     });
 
     socket.addEventListener("close", () => {
       if (heartbeat) clearInterval(heartbeat);
       heartbeat = undefined;
+      active = undefined;
       if (!stopped) setTimeout(connect, 1_000);
     });
   };
