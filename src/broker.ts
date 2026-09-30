@@ -407,11 +407,11 @@ export function startBroker(options: number | BrokerOptions = 8787) {
   const scheme = config.tls ? "https" : "http";
   console.log(`meshwork broker listening on ${scheme}://localhost:${server.port}`);
 
-  return {
-    ...server,
+  const originalStop = server.stop.bind(server);
+  return Object.assign(server, {
     stop(closeActiveConnections?: boolean) {
       clearInterval(reaper);
-      return server.stop(closeActiveConnections);
+      return originalStop(closeActiveConnections);
     },
-  };
+  });
 }
