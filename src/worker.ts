@@ -20,6 +20,7 @@ export type WorkerOptions = {
   brokerUrl?: string;
   id?: string;
   name?: string;
+  accessToken?: string;
   handlers?: Record<string, CapabilityHandler>;
 };
 
@@ -46,17 +47,21 @@ export function startWorker(options: WorkerOptions = {}) {
   let socket: WebSocket | undefined;
   let heartbeat: Timer | undefined;
   let stopped = false;
-  let active:
-    | { taskId: string; attemptId: string }
-    | undefined;
+  let active: { taskId: string; attemptId: string } | undefined;
 
   const send = (message: WorkerToBroker) => {
-    if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
+    if (socket?.readyState === WebSocket.OPEN)
+      socket.send(JSON.stringify(message));
   };
 
   const connect = () => {
     if (stopped) return;
-    socket = new WebSocket(brokerUrl);
+    socket = new WebSocket(
+      brokerUrl,
+      options.accessToken
+        ? { headers: { authorization: `Bearer ${options.accessToken}` } }
+        : undefined,
+    );
 
     socket.addEventListener("open", () => {
       send({ type: "worker.hello", worker });

@@ -1,0 +1,44 @@
+import { test, expect } from "bun:test";
+
+// Exercise the browser module with the codec support boundary substituted.
+// No GPU or desktop codec assumptions enter these compatibility tests.
+const source = await Bun.file(new URL("./render-video.js", import.meta.url)).text();
+function moduleWith(canEncodeVideo: (codec: string, options: any) => Promise<boolean>) {
+  const body = source.replace(/^import\s*\{[\s\S]*?\}\s*from\s*"\/vendor\/mediabunny.js";/, "const { Quality, canEncodeVideo } = dependencies;")
+    .replace(/import \{applyLiveScene\} from '\/live-scene.js';/, 'const applyLiveScene=()=>{};')
+    .replace(/export async function/g, "async function");
+  class Quality { constructor(public options: any) {} }
+  return new Function("dependencies", body + "\nreturn { videoCodecs, renderVideoSegment };")({ Quality, canEncodeVideo });
+}
+
+test("advertise 720p codecs with hardware preference fallback and matching realtime settings", async () => {
+  const previous = (globalThis as any).VideoEncoder;
+  (globalThis as any).VideoEncoder = {};
+  try {
+    const calls: any[] = [];
+    const module = moduleWith(async (codec, options) => {
+      calls.push({ codec, ...options });
+      return options.hardwareAcceleration === "no-preference";
+    });
+    expect(await module.videoCodecs()).toEqual(["avc", "hevc"]);
+    expect(calls.map((c) => c.hardwareAcceleration)).toEqual([
+      "prefer-hardware", "no-preference", "prefer-hardware", "no-preference",
+    ]);
+    for (const call of calls) {
+      expect([call.width, call.height, call.frameRate]).toEqual([1280, 720, 60]);
+      expect(call.latencyMode).toBe("realtime");
+      expect(call.quality.options.bitrate).toBe(6635520);
+    }
+  } finally { (globalThis as any).VideoEncoder = previous; }
+});
+
+test("unsupported actual task codec reports dimensions and failure stage before loading GPU", async () => {
+  const calls: any[] = [];
+  const module = moduleWith(async (_, options) => { calls.push(options); return false; });
+  await expect(module.renderVideoSegment(
+    { codec: "avc", width: 1920, height: 1080, fps: 30, frameCount: 120 },
+    null, new AbortController().signal,
+  )).rejects.toThrow("check video encoder: avc encoding unavailable for 1920×1080 at 30 fps");
+  expect(calls).toHaveLength(2);
+  expect(calls.every((c) => c.width === 1920 && c.height === 1080 && c.frameRate === 30)).toBe(true);
+});

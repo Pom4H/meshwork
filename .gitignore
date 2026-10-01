@@ -1,2 +1,4 @@
 .meshwork/
 .meshwork-test-artifacts/
+node_modules/
+artifacts/

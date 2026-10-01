@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { bundleScene } from "./scenes";
 import { startBroker } from "./broker";
 import type {
   BrokerToWorker,
@@ -22,18 +23,25 @@ async function connectWorker(
   port: number,
   id: string,
   capabilities: string[],
+  videoCodecs?: string[],
 ) {
   const socket = new WebSocket(`ws://127.0.0.1:${port}/ws`);
   await new Promise<void>((resolve, reject) => {
     socket.addEventListener("open", () => resolve(), { once: true });
-    socket.addEventListener("error", () => reject(new Error("websocket failed")), {
-      once: true,
-    });
+    socket.addEventListener(
+      "error",
+      () => reject(new Error("websocket failed")),
+      {
+        once: true,
+      },
+    );
   });
-  socket.send(JSON.stringify({
-    type: "worker.hello",
-    worker: { id, name: id, platform: "bun", capabilities },
-  }));
+  socket.send(
+    JSON.stringify({
+      type: "worker.hello",
+      worker: { id, name: id, platform: "bun", capabilities, videoCodecs },
+    }),
+  );
   return socket;
 }
 
@@ -53,6 +61,31 @@ function nextMessage<T extends BrokerToWorker["type"]>(
 }
 
 describe("broker", () => {
+  test("a leased shard holds its worker until revoked before ordinary work can run", async () => {
+    broker = startBroker({ port: 0, artifactDir });
+    const base = `http://127.0.0.1:${broker.port}`;
+    const socket = await connectWorker(broker.port!, "mixed-node", ["world.region.v1", "echo.test"]);
+    const shardAssignment = nextMessage(socket, "shard.assign");
+    const shard = await fetch(base + "/shards", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ capability: "world.region.v1" }),
+    }).then(r => r.json() as Promise<ShardState>);
+    const leased = await shardAssignment;
+    const nodes = await fetch(base + "/workers").then(r => r.json() as Promise<any[]>);
+    expect(nodes[0].busy).toBe(true);
+    expect(nodes[0].shardId).toBe(shard.shard.id);
+    expect(nodes[0].shardLeaseId).toBe(leased.leaseId);
+    const task = await fetch(base + "/tasks", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ capability: "echo.test", input: { value: 1 } }),
+    }).then(r => r.json() as Promise<TaskState>);
+    expect(task.status).toBe("pending");
+    const assignment = nextMessage(socket, "task.assign");
+    await fetch(`${base}/shards/${shard.shard.id}/stop`, { method: "POST" });
+    expect((await assignment).task.id).toBe(task.task.id);
+    socket.close();
+  });
+
   test("assigns work and accepts only the active attempt", async () => {
     broker = startBroker({
       port: 0,
@@ -61,7 +94,9 @@ describe("broker", () => {
       heartbeatTimeoutMs: 2_000,
     });
     const base = `http://127.0.0.1:${broker.port}`;
-    const socket = await connectWorker(broker.port!, "test-worker", ["echo.test"]);
+    const socket = await connectWorker(broker.port!, "test-worker", [
+      "echo.test",
+    ]);
 
     const assignmentPromise = nextMessage(socket, "task.assign");
     const submittedResponse = await fetch(`${base}/tasks`, {
@@ -73,24 +108,28 @@ describe("broker", () => {
 
     const assignment = await assignmentPromise;
 
-    socket.send(JSON.stringify({
-      type: "task.result",
-      taskId: assignment.task.id,
-      attemptId: "stale-attempt",
-      output: { bad: true },
-    }));
+    socket.send(
+      JSON.stringify({
+        type: "task.result",
+        taskId: assignment.task.id,
+        attemptId: "stale-attempt",
+        output: { bad: true },
+      }),
+    );
 
     let state = await fetch(`${base}/tasks/${assignment.task.id}`).then(
       (response) => response.json() as Promise<TaskState>,
     );
     expect(state.status).toBe("running");
 
-    socket.send(JSON.stringify({
-      type: "task.result",
-      taskId: assignment.task.id,
-      attemptId: assignment.attemptId,
-      output: { ok: true },
-    }));
+    socket.send(
+      JSON.stringify({
+        type: "task.result",
+        taskId: assignment.task.id,
+        attemptId: assignment.attemptId,
+        output: { ok: true },
+      }),
+    );
 
     for (let index = 0; index < 20; index += 1) {
       state = await fetch(`${base}/tasks/${assignment.task.id}`).then(
@@ -113,8 +152,12 @@ describe("broker", () => {
       heartbeatTimeoutMs: 2_000,
     });
     const base = `http://127.0.0.1:${broker.port}`;
-    const first = await connectWorker(broker.port!, "render-a", ["render.segment.test"]);
-    const second = await connectWorker(broker.port!, "render-b", ["render.segment.test"]);
+    const first = await connectWorker(broker.port!, "render-a", [
+      "render.segment.test",
+    ]);
+    const second = await connectWorker(broker.port!, "render-b", [
+      "render.segment.test",
+    ]);
 
     const streamResponse = await fetch(`${base}/streams`, {
       method: "POST",
@@ -133,7 +176,7 @@ describe("broker", () => {
       }),
     });
     expect(streamResponse.status).toBe(201);
-    const stream = await streamResponse.json() as StreamState;
+    const stream = (await streamResponse.json()) as StreamState;
 
     const a = nextMessage(first, "task.assign");
     const b = nextMessage(second, "task.assign");
@@ -157,7 +200,9 @@ describe("broker", () => {
     expect(inputs.map((input) => input.epoch)).toEqual([0, 0]);
     expect(inputs[0]?.warmupStartFrame).toBe(0);
     expect(inputs[1]?.warmupStartFrame).toBe(22);
-    expect(inputs.every((input) => input.width === 3840 && input.height === 2160)).toBe(true);
+    expect(
+      inputs.every((input) => input.width === 3840 && input.height === 2160),
+    ).toBe(true);
 
     first.close();
     second.close();
@@ -339,7 +384,9 @@ describe("broker", () => {
       heartbeatTimeoutMs: 2_000,
     });
     const base = `http://127.0.0.1:${broker.port}`;
-    const socket = await connectWorker(broker.port!, "render-a", ["render.segment.test"]);
+    const socket = await connectWorker(broker.port!, "render-a", [
+      "render.segment.test",
+    ]);
 
     const stream = await fetch(`${base}/streams`, {
       method: "POST",
@@ -384,16 +431,18 @@ describe("broker", () => {
     expect(cancel.taskId).toBe(oldAssignment.task.id);
     expect(cancel.attemptId).toBe(oldAssignment.attemptId);
 
-    socket.send(JSON.stringify({
-      type: "task.result",
-      taskId: oldAssignment.task.id,
-      attemptId: oldAssignment.attemptId,
-      output: { stale: true },
-    }));
+    socket.send(
+      JSON.stringify({
+        type: "task.result",
+        taskId: oldAssignment.task.id,
+        attemptId: oldAssignment.attemptId,
+        output: { stale: true },
+      }),
+    );
 
-    const oldState = await fetch(
-      `${base}/tasks/${oldAssignment.task.id}`,
-    ).then((response) => response.json() as Promise<TaskState>);
+    const oldState = await fetch(`${base}/tasks/${oldAssignment.task.id}`).then(
+      (response) => response.json() as Promise<TaskState>,
+    );
     expect(oldState.status).toBe("cancelled");
 
     const newAssignmentPromise = nextMessage(socket, "task.assign");
@@ -405,8 +454,276 @@ describe("broker", () => {
     const next = await newAssignmentPromise;
     expect(next.task.cause?.epoch).toBe(1);
     expect(next.task.cause?.startFrame).toBe(30);
-    expect((next.task.input as RenderSegmentInput).snapshotHash).toBe("snapshot-30");
+    expect((next.task.input as RenderSegmentInput).snapshotHash).toBe(
+      "snapshot-30",
+    );
 
     socket.close();
   });
 });
+
+async function videoBroker() {
+  const engine = artifactDir + "/engine";
+  mkdirSync(engine + "/dist/runtime", { recursive: true });
+  mkdirSync(engine + "/tools/scene", { recursive: true });
+  writeFileSync(
+    engine + "/dist/runtime/browser.js",
+    "export class BrowserRuntime {}",
+  );
+  writeFileSync(
+    engine + "/tools/scene/scene.mjs",
+    "export default {entities:[]}",
+  );
+  const bundle = await bundleScene(
+    engine,
+    "tools/scene/scene.mjs",
+    "test",
+    artifactDir + "/scenes",
+  );
+  broker = startBroker({
+    port: 0,
+    artifactDir,
+    sceneDir: artifactDir + "/scenes",
+  });
+  const base = `http://127.0.0.1:${broker.port}`;
+  const create = async (live = false) =>
+    await fetch(base + "/streams", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        capability: "render.video.segment.v1",
+        width: 3840,
+        height: 2160,
+        fps: 60,
+        codec: "avc",
+        segmentFrames: 120,
+        warmupFrames: 24,
+        sceneHash: bundle.sceneHash,
+        renderHash: bundle.renderHash,
+        live,
+      }),
+    }).then((r) => r.json() as Promise<StreamState>);
+  return { base, bundle, create };
+}
+
+test("live 4K stream assigns non-overlapping ranges to codec-compatible workers and stops", async () => {
+  const { base, create } = await videoBroker();
+  const a = await connectWorker(
+    broker!.port!,
+    "ipad-a",
+    ["render.video.segment.v1"],
+    ["avc"],
+  );
+  const b = await connectWorker(
+    broker!.port!,
+    "ipad-b",
+    ["render.video.segment.v1"],
+    ["avc"],
+  );
+  const incompatible = await connectWorker(
+    broker!.port!,
+    "ipad-hevc",
+    ["render.video.segment.v1"],
+    ["hevc"],
+  );
+  const ap = nextMessage(a, "task.assign"),
+    bp = nextMessage(b, "task.assign");
+  const stream = await create(true);
+  const assignments = await Promise.all([ap, bp]);
+  expect(
+    assignments
+      .map((s) => (s.task.input as RenderSegmentInput).startFrame)
+      .sort((x, y) => x - y),
+  ).toEqual([0, 120]);
+  expect(
+    assignments.every(
+      (s) => (s.task.input as RenderSegmentInput).width === 3840,
+    ),
+  ).toBe(true);
+  const states = await fetch(`${base}/streams/${stream.spec.id}/segments`).then(
+    (r) => r.json() as Promise<TaskState[]>,
+  );
+  expect(states.length).toBe(4);
+  expect(new Set(states.map((s) => s.task.cause!.startFrame)).size).toBe(4);
+  expect(
+    (
+      await fetch(base + "/workers").then(
+        (r) => r.json() as Promise<{ id: string; busy: boolean }[]>,
+      )
+    ).find((w) => w.id === "ipad-hevc")!.busy,
+  ).toBe(false);
+  await fetch(`${base}/streams/${stream.spec.id}/stop`, { method: "POST" });
+  const stopped = await fetch(
+    `${base}/streams/${stream.spec.id}/segments`,
+  ).then((r) => r.json() as Promise<TaskState[]>);
+  expect(stopped.every((s) => s.status === "cancelled")).toBe(true);
+  const overlap = await fetch(`${base}/streams/${stream.spec.id}/segments`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ count: 1 }),
+  });
+  expect(overlap.status).toBe(409);
+  a.close();
+  b.close();
+  incompatible.close();
+});
+
+test("lost worker's range is retried, and late uploads from the old attempt are rejected", async () => {
+  const { base, create } = await videoBroker();
+  const a = await connectWorker(
+    broker!.port!,
+    "ipad-a",
+    ["render.video.segment.v1"],
+    ["avc"],
+  );
+  const ap = nextMessage(a, "task.assign");
+  const stream = await create();
+  await fetch(`${base}/streams/${stream.spec.id}/segments`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ count: 1 }),
+  });
+  const first = await ap;
+  const b = await connectWorker(
+    broker!.port!,
+    "ipad-b",
+    ["render.video.segment.v1"],
+    ["avc"],
+  );
+  const bp = nextMessage(b, "task.assign");
+  a.close();
+  const retry = await bp;
+  expect(retry.task.id).toBe(first.task.id);
+  expect(retry.attemptId).not.toBe(first.attemptId);
+  const upload = await fetch(
+    `${base}/artifacts/${first.task.id}/${first.attemptId}`,
+    { method: "POST", body: new Uint8Array([1]) },
+  );
+  expect(upload.status).toBe(409);
+  b.close();
+});
+
+test("scene assets are immutable and segment ranges cannot overlap", async () => {
+  const { base, bundle, create } = await videoBroker();
+  expect(
+    (await fetch(`${base}/scenes/${bundle.sceneHash}/${bundle.entry}`)).status,
+  ).toBe(200);
+  writeFileSync(
+    `${artifactDir}/scenes/${bundle.sceneHash}/${bundle.entry}`,
+    "changed",
+  );
+  expect(
+    (await fetch(`${base}/scenes/${bundle.sceneHash}/${bundle.entry}`)).status,
+  ).toBe(409);
+  const stream = await create();
+  const queue = () =>
+    fetch(`${base}/streams/${stream.spec.id}/segments`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ count: 1, startFrame: 0 }),
+    });
+  expect((await queue()).status).toBe(202);
+  expect((await queue()).status).toBe(409);
+});
+
+test("access links grant a session cookie; APIs and websockets require credentials", async () => {
+  broker = startBroker({ port: 0, artifactDir, accessToken: "test-secret" });
+  const base = `http://127.0.0.1:${broker.port}`;
+  expect((await fetch(base + "/workers")).status).toBe(401);
+  expect((await fetch(base + "/ws")).status).toBe(401);
+  const login = await fetch(base + "/?access_token=test-secret", {
+    redirect: "manual",
+  });
+  expect(login.status).toBe(303);
+  expect(login.headers.get("location")).toBe("/");
+  const cookie = login.headers.get("set-cookie")!.split(";")[0]!;
+  expect((await fetch(base + "/workers", { headers: { cookie } })).status).toBe(
+    200,
+  );
+  expect(
+    (
+      await fetch(base + "/streams", {
+        method: "POST",
+        headers: { cookie, origin: "https://other.example" },
+      })
+    ).status,
+  ).toBe(403);
+  const socket = new WebSocket(base.replace("http", "ws") + "/ws", {
+    headers: { authorization: "Bearer test-secret" },
+  });
+  await new Promise<void>((r, j) => {
+    socket.addEventListener("open", () => r(), { once: true });
+    socket.addEventListener("error", () => j(Error("Auth WS failed")), {
+      once: true,
+    });
+  });
+  socket.close();
+});
+
+test("video retry avoids a failing node and stops after compatible nodes fail", async () => {
+  const { base, create } = await videoBroker();
+  const a = await connectWorker(
+    broker!.port!,
+    "a",
+    ["render.video.segment.v1"],
+    ["avc"],
+  );
+  const ap = nextMessage(a, "task.assign");
+  const stream = await create(true);
+  const first = await ap;
+  // Register the alternative as the first result fails, before it takes work.
+  const b = await connectWorker(
+    broker!.port!,
+    "b",
+    ["render.video.segment.v1"],
+    ["avc"],
+  );
+  const bp = nextMessage(b, "task.assign");
+  a.send(
+    JSON.stringify({
+      type: "task.error",
+      taskId: first.task.id,
+      attemptId: first.attemptId,
+      error: "GPU failed",
+    }),
+  );
+  const second = await bp;
+  // b may already have taken another range; fail it so the failed first range
+  // can be retried on b when it becomes free.
+  const retryPromise = nextMessage(b, "task.assign");
+  b.send(
+    JSON.stringify({
+      type: "task.error",
+      taskId: second.task.id,
+      attemptId: second.attemptId,
+      error: "GPU failed",
+    }),
+  );
+  // Both nodes rejecting the same task is terminal and must freeze live refill.
+  if (second.task.id !== first.task.id) {
+    const retry = await retryPromise;
+    expect(retry.task.id).toBe(first.task.id);
+    b.send(
+      JSON.stringify({
+        type: "task.error",
+        taskId: retry.task.id,
+        attemptId: retry.attemptId,
+        error: "GPU failed",
+      }),
+    );
+  }
+  for (let n = 0; n < 100; n++) {
+    const state = await fetch(`${base}/streams/${stream.spec.id}`).then(
+      (r) => r.json() as Promise<StreamState>,
+    );
+    if (state.status === "stopped") break;
+    await Bun.sleep(10);
+  }
+  const state = await fetch(`${base}/streams/${stream.spec.id}`).then(
+    (r) => r.json() as Promise<StreamState>,
+  );
+  expect(state.status).toBe("stopped");
+  expect(state.error).toBe("GPU failed");
+  a.close();
+  b.close();
+}, 10000);

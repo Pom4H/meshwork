@@ -1,16 +1,12 @@
 export type JsonValue =
-  | null
-  | boolean
-  | number
-  | string
-  | JsonValue[]
-  | { [key: string]: JsonValue };
+  null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 
 export type WorkerDescriptor = {
   id: string;
   name: string;
   platform: string;
   capabilities: string[];
+  videoCodecs?: string[];
 };
 
 export type TaskCause = {
@@ -151,6 +147,7 @@ export type StreamSpec = {
   codec: string;
   segmentFrames: number;
   warmupFrames: number;
+  live?: boolean;
 };
 
 export type StreamEpoch = {
@@ -164,15 +161,20 @@ export type StreamEpoch = {
 };
 
 export type StreamState = {
+  sceneChanges?: import('./director').SceneChange[];
   spec: StreamSpec;
   currentEpoch: StreamEpoch;
   nextFrame: number;
   status: "active" | "stopped";
   createdAt: number;
   updatedAt: number;
+  playbackStartFrame?: number;
+  mediaSequence?: number;
+  error?: string;
 };
 
 export type RenderSegmentInput = {
+  sceneChanges?: import('./director').SceneChange[];
   streamId: string;
   epoch: number;
   segmentId: string;
