@@ -250,26 +250,54 @@ export function startBroker(options: number | BrokerOptions = 8787) {
     }
   };
 
-  const shardClock = (
+  const shardLease = (
     workerId: string,
     shardId: string,
     leaseId: string,
     epoch: number,
-    tick: number,
   ) => {
-    if (!nonNegativeInt(epoch) || !nonNegativeInt(tick)) return;
+    if (!nonNegativeInt(epoch)) return;
     const state = shards.get(shardId);
     if (
       !state ||
       state.status !== "leased" ||
       state.workerId !== workerId ||
       state.leaseId !== leaseId ||
-      state.shard.epoch !== epoch ||
-      tick < state.tick
+      state.shard.epoch !== epoch
     ) {
       return;
     }
+    return state;
+  };
+
+  const renewShard = (
+    workerId: string,
+    shardId: string,
+    leaseId: string,
+    epoch: number,
+    observedTick: number,
+  ) => {
+    if (!nonNegativeInt(observedTick)) return;
+    const state = shardLease(workerId, shardId, leaseId, epoch);
+    if (!state || observedTick < state.tick) return;
+    state.observedTick = Math.max(state.observedTick ?? state.tick, observedTick);
+    state.leaseUntil = Date.now() + leaseMs;
+    state.updatedAt = Date.now();
+    return state;
+  };
+
+  const publishShard = (
+    workerId: string,
+    shardId: string,
+    leaseId: string,
+    epoch: number,
+    tick: number,
+  ) => {
+    if (!nonNegativeInt(tick)) return;
+    const state = shardLease(workerId, shardId, leaseId, epoch);
+    if (!state || tick < state.tick) return;
     state.tick = tick;
+    state.observedTick = Math.max(state.observedTick ?? tick, tick);
     state.leaseUntil = Date.now() + leaseMs;
     state.updatedAt = Date.now();
     return state;
@@ -607,6 +635,7 @@ export function startBroker(options: number | BrokerOptions = 8787) {
             shard,
             status: "pending",
             tick: startTick,
+            observedTick: startTick,
             snapshotHash: body.snapshotHash as string | undefined,
             createdAt: now,
             updatedAt: now,
@@ -656,6 +685,7 @@ export function startBroker(options: number | BrokerOptions = 8787) {
             input: body.input ?? state.shard.input,
           };
           state.tick = nextTick;
+          state.observedTick = nextTick;
           state.snapshotHash =
             body.snapshotHash === undefined
               ? state.snapshotHash
@@ -1110,7 +1140,7 @@ export function startBroker(options: number | BrokerOptions = 8787) {
           );
         } else if (message.type === "shard.heartbeat") {
           if (message.workerId !== workerId) return;
-          shardClock(
+          renewShard(
             workerId,
             message.shardId,
             message.leaseId,
@@ -1118,7 +1148,7 @@ export function startBroker(options: number | BrokerOptions = 8787) {
             message.tick,
           );
         } else if (message.type === "shard.publish") {
-          const state = shardClock(
+          const state = publishShard(
             workerId,
             message.shardId,
             message.leaseId,
@@ -1135,7 +1165,7 @@ export function startBroker(options: number | BrokerOptions = 8787) {
             current.lastAffinityKey = state.shard.affinityKey;
           }
         } else if (message.type === "shard.error") {
-          const state = shardClock(
+          const state = renewShard(
             workerId,
             message.shardId,
             message.leaseId,
