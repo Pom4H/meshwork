@@ -204,6 +204,12 @@ describe("broker", () => {
     }));
     await Bun.sleep(10);
 
+    let heartbeatState = await fetch(`${base}/shards/${assignment.shard.id}`).then(
+      (result) => result.json() as Promise<ShardState>,
+    );
+    expect(heartbeatState.tick).toBe(10);
+    expect(heartbeatState.observedTick).toBe(12);
+
     socket.send(JSON.stringify({
       type: "shard.publish",
       shardId: assignment.shard.id,

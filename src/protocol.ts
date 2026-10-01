@@ -57,7 +57,10 @@ export type ShardAssignment = {
 export type ShardState = {
   shard: ShardSpec;
   status: "pending" | "leased" | "stopped";
+  /** Last atomically published tick; safe migration resume point. */
   tick: number;
+  /** Latest liveness/telemetry tick reported by the current owner. */
+  observedTick?: number;
   workerId?: string;
   leaseId?: string;
   leaseUntil?: number;
