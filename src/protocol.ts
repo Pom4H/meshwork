@@ -13,10 +13,21 @@ export type WorkerDescriptor = {
   capabilities: string[];
 };
 
+export type TaskCause = {
+  streamId: string;
+  epoch: number;
+  segmentId?: string;
+  startFrame?: number;
+};
+
 export type Task = {
   id: string;
   capability: string;
   input: JsonValue;
+  cause?: TaskCause;
+  affinityKey?: string;
+  deadlineAt?: number;
+  priority?: number;
 };
 
 export type TaskAssignment = {
@@ -52,7 +63,7 @@ export type BrokerToWorker =
 
 export type TaskState = {
   task: Task;
-  status: "pending" | "running" | "completed" | "failed";
+  status: "pending" | "running" | "completed" | "failed" | "cancelled";
   workerId?: string;
   attemptId?: string;
   leaseUntil?: number;
@@ -61,4 +72,51 @@ export type TaskState = {
   updatedAt: number;
   output?: JsonValue;
   error?: string;
+};
+
+export type StreamSpec = {
+  id: string;
+  capability: string;
+  width: number;
+  height: number;
+  fps: number;
+  codec: string;
+  segmentFrames: number;
+  warmupFrames: number;
+};
+
+export type StreamEpoch = {
+  streamId: string;
+  id: number;
+  startFrame: number;
+  sceneHash: string;
+  renderHash: string;
+  snapshotHash?: string;
+  createdAt: number;
+};
+
+export type StreamState = {
+  spec: StreamSpec;
+  currentEpoch: StreamEpoch;
+  nextFrame: number;
+  status: "active" | "stopped";
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type RenderSegmentInput = {
+  streamId: string;
+  epoch: number;
+  segmentId: string;
+  startFrame: number;
+  frameCount: number;
+  warmupStartFrame: number;
+  warmupFrames: number;
+  width: number;
+  height: number;
+  fps: number;
+  codec: string;
+  sceneHash: string;
+  renderHash: string;
+  snapshotHash?: string;
 };
