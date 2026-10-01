@@ -36,6 +36,38 @@ export type TaskAssignment = {
   leaseUntil: number;
 };
 
+export type ShardSpec = {
+  id: string;
+  capability: string;
+  input: JsonValue;
+  epoch: number;
+  startTick: number;
+  affinityKey?: string;
+};
+
+export type ShardAssignment = {
+  shard: ShardSpec;
+  leaseId: string;
+  leaseUntil: number;
+  resumeTick: number;
+  snapshotHash?: string;
+  publication?: JsonValue;
+};
+
+export type ShardState = {
+  shard: ShardSpec;
+  status: "pending" | "leased" | "stopped";
+  tick: number;
+  workerId?: string;
+  leaseId?: string;
+  leaseUntil?: number;
+  snapshotHash?: string;
+  publication?: JsonValue;
+  error?: string;
+  createdAt: number;
+  updatedAt: number;
+};
+
 export type WorkerToBroker =
   | { type: "worker.hello"; worker: WorkerDescriptor }
   | {
@@ -55,11 +87,44 @@ export type WorkerToBroker =
       taskId: string;
       attemptId: string;
       error: string;
+    }
+  | {
+      type: "shard.heartbeat";
+      workerId: string;
+      shardId: string;
+      leaseId: string;
+      epoch: number;
+      tick: number;
+    }
+  | {
+      type: "shard.publish";
+      shardId: string;
+      leaseId: string;
+      epoch: number;
+      tick: number;
+      snapshotHash?: string;
+      output: JsonValue;
+    }
+  | {
+      type: "shard.error";
+      shardId: string;
+      leaseId: string;
+      epoch: number;
+      tick: number;
+      error: string;
     };
 
 export type BrokerToWorker =
   | ({ type: "task.assign" } & TaskAssignment)
-  | { type: "task.cancel"; taskId: string; attemptId: string };
+  | { type: "task.cancel"; taskId: string; attemptId: string }
+  | ({ type: "shard.assign" } & ShardAssignment)
+  | {
+      type: "shard.revoke";
+      shardId: string;
+      leaseId: string;
+      epoch: number;
+      reason: string;
+    };
 
 export type TaskState = {
   task: Task;
