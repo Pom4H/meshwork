@@ -5,6 +5,8 @@ import type {
   BrokerToWorker,
   JsonValue,
   RenderSegmentInput,
+  ShardSpec,
+  ShardState,
   StreamEpoch,
   StreamSpec,
   StreamState,
@@ -21,6 +23,8 @@ type ConnectedWorker = {
   socket: ServerWebSocket<SocketData>;
   taskId?: string;
   attemptId?: string;
+  shardId?: string;
+  shardLeaseId?: string;
   lastSeenAt: number;
   lastAffinityKey?: string;
 };
@@ -59,6 +63,7 @@ export function startBroker(options: number | BrokerOptions = 8787) {
   const workers = new Map<string, ConnectedWorker>();
   const tasks = new Map<string, TaskState>();
   const streams = new Map<string, StreamState>();
+  const shards = new Map<string, ShardState>();
   const pending: string[] = [];
 
   const send = (worker: ConnectedWorker, message: BrokerToWorker) => {
@@ -141,6 +146,135 @@ export function startBroker(options: number | BrokerOptions = 8787) {
     enqueue(state, true);
   };
 
+  const releaseShardWorker = (
+    workerId: string,
+    shardId: string,
+    leaseId: string,
+  ) => {
+    const worker = workers.get(workerId);
+    if (worker?.shardId === shardId && worker.shardLeaseId === leaseId) {
+      worker.shardId = undefined;
+      worker.shardLeaseId = undefined;
+    }
+  };
+
+  const requeueShard = (state: ShardState, reason?: string) => {
+    if (state.status !== "leased") return;
+    if (state.workerId && state.leaseId) {
+      releaseShardWorker(state.workerId, state.shard.id, state.leaseId);
+    }
+    state.status = "pending";
+    state.workerId = undefined;
+    state.leaseId = undefined;
+    state.leaseUntil = undefined;
+    state.error = reason;
+    state.updatedAt = Date.now();
+  };
+
+  const revokeShard = (
+    state: ShardState,
+    reason: string,
+    requeue: boolean,
+  ) => {
+    if (state.status === "leased" && state.workerId && state.leaseId) {
+      const worker = workers.get(state.workerId);
+      if (
+        worker?.shardId === state.shard.id &&
+        worker.shardLeaseId === state.leaseId
+      ) {
+        send(worker, {
+          type: "shard.revoke",
+          shardId: state.shard.id,
+          leaseId: state.leaseId,
+          epoch: state.shard.epoch,
+          reason,
+        });
+      }
+      releaseShardWorker(state.workerId, state.shard.id, state.leaseId);
+    }
+    state.status = requeue ? "pending" : "stopped";
+    state.workerId = undefined;
+    state.leaseId = undefined;
+    state.leaseUntil = undefined;
+    state.error = reason;
+    state.updatedAt = Date.now();
+  };
+
+  const chooseShardWorker = (shard: ShardSpec) => {
+    const candidates = [...workers.values()].filter(
+      (candidate) =>
+        candidate.taskId === undefined &&
+        candidate.shardId === undefined &&
+        candidate.descriptor.capabilities.includes(shard.capability),
+    );
+    candidates.sort((a, b) => {
+      const aAffinity = Number(
+        shard.affinityKey !== undefined &&
+          a.lastAffinityKey === shard.affinityKey,
+      );
+      const bAffinity = Number(
+        shard.affinityKey !== undefined &&
+          b.lastAffinityKey === shard.affinityKey,
+      );
+      return bAffinity - aAffinity || b.lastSeenAt - a.lastSeenAt;
+    });
+    return candidates[0];
+  };
+
+  const scheduleShards = () => {
+    for (const state of shards.values()) {
+      if (state.status !== "pending") continue;
+      const worker = chooseShardWorker(state.shard);
+      if (!worker) continue;
+
+      const leaseId = crypto.randomUUID();
+      const leaseUntil = Date.now() + leaseMs;
+      state.status = "leased";
+      state.workerId = worker.descriptor.id;
+      state.leaseId = leaseId;
+      state.leaseUntil = leaseUntil;
+      state.error = undefined;
+      state.updatedAt = Date.now();
+      worker.shardId = state.shard.id;
+      worker.shardLeaseId = leaseId;
+
+      send(worker, {
+        type: "shard.assign",
+        shard: state.shard,
+        leaseId,
+        leaseUntil,
+        resumeTick: state.tick,
+        snapshotHash: state.snapshotHash,
+        publication: state.publication,
+      });
+    }
+  };
+
+  const shardClock = (
+    workerId: string,
+    shardId: string,
+    leaseId: string,
+    epoch: number,
+    tick: number,
+  ) => {
+    if (!nonNegativeInt(epoch) || !nonNegativeInt(tick)) return;
+    const state = shards.get(shardId);
+    if (
+      !state ||
+      state.status !== "leased" ||
+      state.workerId !== workerId ||
+      state.leaseId !== leaseId ||
+      state.shard.epoch !== epoch ||
+      tick < state.tick
+    ) {
+      return;
+    }
+    state.tick = tick;
+    state.leaseUntil = Date.now() + leaseMs;
+    state.updatedAt = Date.now();
+    return state;
+  };
+
   const pendingOrder = (aId: string, bId: string) => {
     const a = tasks.get(aId)?.task;
     const b = tasks.get(bId)?.task;
@@ -157,6 +291,7 @@ export function startBroker(options: number | BrokerOptions = 8787) {
     const candidates = [...workers.values()].filter(
       (candidate) =>
         candidate.taskId === undefined &&
+        candidate.shardId === undefined &&
         candidate.descriptor.capabilities.includes(task.capability),
     );
     candidates.sort((a, b) => {
@@ -172,6 +307,7 @@ export function startBroker(options: number | BrokerOptions = 8787) {
   };
 
   const schedule = () => {
+    scheduleShards();
     pending.sort(pendingOrder);
 
     for (let index = 0; index < pending.length; ) {
@@ -285,6 +421,16 @@ export function startBroker(options: number | BrokerOptions = 8787) {
         const state = tasks.get(worker.taskId);
         if (state?.status === "running") requeue(state);
       }
+      if (worker.shardId) {
+        const state = shards.get(worker.shardId);
+        if (
+          state?.status === "leased" &&
+          state.workerId === workerId &&
+          state.leaseId === worker.shardLeaseId
+        ) {
+          requeueShard(state, "worker heartbeat timeout");
+        }
+      }
       workers.delete(workerId);
       worker.socket.close(1012, "heartbeat timeout");
     }
@@ -296,6 +442,16 @@ export function startBroker(options: number | BrokerOptions = 8787) {
         state.leaseUntil <= now
       ) {
         requeue(state);
+      }
+    }
+
+    for (const state of shards.values()) {
+      if (
+        state.status === "leased" &&
+        state.leaseUntil !== undefined &&
+        state.leaseUntil <= now
+      ) {
+        requeueShard(state, "shard lease expired");
       }
     }
 
@@ -340,6 +496,7 @@ export function startBroker(options: number | BrokerOptions = 8787) {
           workers: workers.size,
           tasks: tasks.size,
           streams: streams.size,
+          shards: shards.size,
         });
       }
 
@@ -350,6 +507,8 @@ export function startBroker(options: number | BrokerOptions = 8787) {
             busy: worker.taskId !== undefined,
             taskId: worker.taskId,
             attemptId: worker.attemptId,
+            shardId: worker.shardId,
+            shardLeaseId: worker.shardLeaseId,
             lastSeenAt: worker.lastSeenAt,
             lastAffinityKey: worker.lastAffinityKey,
           })),
@@ -395,6 +554,124 @@ export function startBroker(options: number | BrokerOptions = 8787) {
         const taskId = url.pathname.slice("/tasks/".length);
         const state = tasks.get(taskId);
         return state ? json(state) : json({ error: "task not found" }, 404);
+      }
+
+
+      if (parts[0] === "shards" && parts.length === 1) {
+        if (request.method === "GET") {
+          return json([...shards.values()]);
+        }
+
+        if (request.method === "POST") {
+          const body = (await request.json()) as {
+            capability?: unknown;
+            input?: JsonValue;
+            startTick?: unknown;
+            snapshotHash?: unknown;
+            affinityKey?: unknown;
+          };
+          if (!nonEmpty(body.capability)) {
+            return json({ error: "capability must be a non-empty string" }, 400);
+          }
+          if (
+            body.startTick !== undefined &&
+            !nonNegativeInt(body.startTick)
+          ) {
+            return json({ error: "startTick must be a non-negative integer" }, 400);
+          }
+          if (
+            body.snapshotHash !== undefined &&
+            typeof body.snapshotHash !== "string"
+          ) {
+            return json({ error: "snapshotHash must be a string" }, 400);
+          }
+          if (
+            body.affinityKey !== undefined &&
+            typeof body.affinityKey !== "string"
+          ) {
+            return json({ error: "affinityKey must be a string" }, 400);
+          }
+
+          const now = Date.now();
+          const id = crypto.randomUUID();
+          const startTick = (body.startTick as number | undefined) ?? 0;
+          const shard: ShardSpec = {
+            id,
+            capability: body.capability,
+            input: body.input ?? null,
+            epoch: 0,
+            startTick,
+            affinityKey: body.affinityKey as string | undefined,
+          };
+          const state: ShardState = {
+            shard,
+            status: "pending",
+            tick: startTick,
+            snapshotHash: body.snapshotHash as string | undefined,
+            createdAt: now,
+            updatedAt: now,
+          };
+          shards.set(id, state);
+          schedule();
+          return json(state, 201);
+        }
+      }
+
+      if (parts[0] === "shards" && parts[1]) {
+        const shardId = parts[1];
+        const state = shards.get(shardId);
+        if (!state) return json({ error: "shard not found" }, 404);
+
+        if (parts.length === 2 && request.method === "GET") {
+          return json(state);
+        }
+
+        if (parts[2] === "epochs" && request.method === "POST") {
+          const body = (await request.json()) as {
+            startTick?: unknown;
+            input?: JsonValue;
+            snapshotHash?: unknown;
+          };
+          if (
+            body.startTick !== undefined &&
+            !nonNegativeInt(body.startTick)
+          ) {
+            return json({ error: "startTick must be a non-negative integer" }, 400);
+          }
+          if (
+            body.snapshotHash !== undefined &&
+            typeof body.snapshotHash !== "string"
+          ) {
+            return json({ error: "snapshotHash must be a string" }, 400);
+          }
+
+          const nextTick =
+            (body.startTick as number | undefined) ?? state.tick;
+          const nextEpoch = state.shard.epoch + 1;
+          revokeShard(state, `superseded by shard epoch ${nextEpoch}`, true);
+          state.shard = {
+            ...state.shard,
+            epoch: nextEpoch,
+            startTick: nextTick,
+            input: body.input ?? state.shard.input,
+          };
+          state.tick = nextTick;
+          state.snapshotHash =
+            body.snapshotHash === undefined
+              ? state.snapshotHash
+              : (body.snapshotHash as string);
+          state.publication = undefined;
+          state.error = undefined;
+          state.updatedAt = Date.now();
+          schedule();
+          return json(state, 201);
+        }
+
+        if (parts[2] === "stop" && request.method === "POST") {
+          revokeShard(state, "shard stopped", false);
+          schedule();
+          return json(state);
+        }
       }
 
       if (parts[0] === "streams" && parts.length === 1) {
@@ -765,6 +1042,20 @@ export function startBroker(options: number | BrokerOptions = 8787) {
         if (message.type === "worker.hello") {
           const previous = workers.get(message.worker.id);
           if (previous && previous.socket !== socket) {
+            if (previous.taskId) {
+              const state = tasks.get(previous.taskId);
+              if (state?.status === "running") requeue(state);
+            }
+            if (previous.shardId) {
+              const state = shards.get(previous.shardId);
+              if (
+                state?.status === "leased" &&
+                state.workerId === previous.descriptor.id &&
+                state.leaseId === previous.shardLeaseId
+              ) {
+                requeueShard(state, "worker reconnected");
+              }
+            }
             previous.socket.close(1012, "worker reconnected");
           }
           socket.data.workerId = message.worker.id;
@@ -817,6 +1108,43 @@ export function startBroker(options: number | BrokerOptions = 8787) {
             message.attemptId,
             { error: message.error },
           );
+        } else if (message.type === "shard.heartbeat") {
+          if (message.workerId !== workerId) return;
+          shardClock(
+            workerId,
+            message.shardId,
+            message.leaseId,
+            message.epoch,
+            message.tick,
+          );
+        } else if (message.type === "shard.publish") {
+          const state = shardClock(
+            workerId,
+            message.shardId,
+            message.leaseId,
+            message.epoch,
+            message.tick,
+          );
+          if (!state) return;
+          state.publication = message.output;
+          if (message.snapshotHash !== undefined) {
+            state.snapshotHash = message.snapshotHash;
+          }
+          const current = workers.get(workerId);
+          if (current && state.shard.affinityKey) {
+            current.lastAffinityKey = state.shard.affinityKey;
+          }
+        } else if (message.type === "shard.error") {
+          const state = shardClock(
+            workerId,
+            message.shardId,
+            message.leaseId,
+            message.epoch,
+            message.tick,
+          );
+          if (!state) return;
+          requeueShard(state, message.error);
+          schedule();
         }
       },
       close: (socket) => {
@@ -828,6 +1156,16 @@ export function startBroker(options: number | BrokerOptions = 8787) {
         if (worker.taskId) {
           const state = tasks.get(worker.taskId);
           if (state?.status === "running") requeue(state);
+        }
+        if (worker.shardId) {
+          const state = shards.get(worker.shardId);
+          if (
+            state?.status === "leased" &&
+            state.workerId === workerId &&
+            state.leaseId === worker.shardLeaseId
+          ) {
+            requeueShard(state, "worker disconnected");
+          }
         }
 
         workers.delete(workerId);

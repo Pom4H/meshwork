@@ -91,6 +91,7 @@ export function startWorker(options: WorkerOptions = {}) {
         return;
       }
 
+      if (message.type !== "task.assign") return;
       if (active) return;
       const handler = handlers[message.task.capability];
       if (!handler) {

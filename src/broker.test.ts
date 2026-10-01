@@ -4,6 +4,7 @@ import { startBroker } from "./broker";
 import type {
   BrokerToWorker,
   RenderSegmentInput,
+  ShardState,
   StreamState,
   TaskState,
 } from "./protocol";
@@ -160,6 +161,168 @@ describe("broker", () => {
 
     first.close();
     second.close();
+  });
+
+  test("leases a causal shard and advances only a monotonic tick", async () => {
+    broker = startBroker({
+      port: 0,
+      artifactDir,
+      leaseMs: 2_000,
+      heartbeatTimeoutMs: 2_000,
+    });
+    const base = `http://127.0.0.1:${broker.port}`;
+    const socket = await connectWorker(broker.port!, "shard-a", ["world.region.v1"]);
+
+    const assignmentPromise = nextMessage(socket, "shard.assign");
+    const response = await fetch(`${base}/shards`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        capability: "world.region.v1",
+        input: { region: "0:0" },
+        startTick: 10,
+        snapshotHash: "snapshot-10",
+        affinityKey: "world:0:0",
+      }),
+    });
+    expect(response.status).toBe(201);
+    const created = await response.json() as ShardState;
+    const assignment = await assignmentPromise;
+
+    expect(assignment.shard.id).toBe(created.shard.id);
+    expect(assignment.shard.epoch).toBe(0);
+    expect(assignment.resumeTick).toBe(10);
+    expect(assignment.snapshotHash).toBe("snapshot-10");
+
+    socket.send(JSON.stringify({
+      type: "shard.heartbeat",
+      workerId: "shard-a",
+      shardId: assignment.shard.id,
+      leaseId: assignment.leaseId,
+      epoch: 0,
+      tick: 12,
+    }));
+    await Bun.sleep(10);
+
+    socket.send(JSON.stringify({
+      type: "shard.publish",
+      shardId: assignment.shard.id,
+      leaseId: assignment.leaseId,
+      epoch: 0,
+      tick: 13,
+      snapshotHash: "snapshot-13",
+      output: { population: 7 },
+    }));
+    await Bun.sleep(10);
+
+    let state = await fetch(`${base}/shards/${assignment.shard.id}`).then(
+      (result) => result.json() as Promise<ShardState>,
+    );
+    expect(state.tick).toBe(13);
+    expect(state.snapshotHash).toBe("snapshot-13");
+    expect(state.publication).toEqual({ population: 7 });
+
+    socket.send(JSON.stringify({
+      type: "shard.heartbeat",
+      workerId: "shard-a",
+      shardId: assignment.shard.id,
+      leaseId: assignment.leaseId,
+      epoch: 0,
+      tick: 11,
+    }));
+    await Bun.sleep(10);
+    state = await fetch(`${base}/shards/${assignment.shard.id}`).then(
+      (result) => result.json() as Promise<ShardState>,
+    );
+    expect(state.tick).toBe(13);
+
+    socket.close();
+  });
+
+  test("new shard epoch revokes the old lease and fences stale publications", async () => {
+    broker = startBroker({
+      port: 0,
+      artifactDir,
+      leaseMs: 2_000,
+      heartbeatTimeoutMs: 2_000,
+    });
+    const base = `http://127.0.0.1:${broker.port}`;
+    const socket = await connectWorker(broker.port!, "shard-a", ["world.region.v1"]);
+
+    const firstAssignmentPromise = nextMessage(socket, "shard.assign");
+    const created = await fetch(`${base}/shards`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        capability: "world.region.v1",
+        input: { region: "0:0" },
+        startTick: 0,
+        snapshotHash: "snapshot-0",
+      }),
+    }).then((result) => result.json() as Promise<ShardState>);
+    const first = await firstAssignmentPromise;
+
+    const revokePromise = nextMessage(socket, "shard.revoke");
+    const secondAssignmentPromise = nextMessage(socket, "shard.assign");
+    const epochResponse = await fetch(
+      `${base}/shards/${created.shard.id}/epochs`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          startTick: 20,
+          input: { region: "0:0", weather: "snow" },
+          snapshotHash: "snapshot-20",
+        }),
+      },
+    );
+    expect(epochResponse.status).toBe(201);
+    const revoke = await revokePromise;
+    const second = await secondAssignmentPromise;
+
+    expect(revoke.leaseId).toBe(first.leaseId);
+    expect(revoke.epoch).toBe(0);
+    expect(second.shard.epoch).toBe(1);
+    expect(second.resumeTick).toBe(20);
+    expect(second.snapshotHash).toBe("snapshot-20");
+
+    socket.send(JSON.stringify({
+      type: "shard.publish",
+      shardId: created.shard.id,
+      leaseId: first.leaseId,
+      epoch: 0,
+      tick: 99,
+      snapshotHash: "stale",
+      output: { stale: true },
+    }));
+    await Bun.sleep(10);
+
+    let state = await fetch(`${base}/shards/${created.shard.id}`).then(
+      (result) => result.json() as Promise<ShardState>,
+    );
+    expect(state.shard.epoch).toBe(1);
+    expect(state.tick).toBe(20);
+    expect(state.publication).toBeUndefined();
+
+    socket.send(JSON.stringify({
+      type: "shard.publish",
+      shardId: created.shard.id,
+      leaseId: second.leaseId,
+      epoch: 1,
+      tick: 21,
+      snapshotHash: "snapshot-21",
+      output: { population: 9 },
+    }));
+    await Bun.sleep(10);
+
+    state = await fetch(`${base}/shards/${created.shard.id}`).then(
+      (result) => result.json() as Promise<ShardState>,
+    );
+    expect(state.tick).toBe(21);
+    expect(state.snapshotHash).toBe("snapshot-21");
+    expect(state.publication).toEqual({ population: 9 });
+
+    socket.close();
   });
 
   test("new epoch cancels obsolete segment and rejects its late result", async () => {
