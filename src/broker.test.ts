@@ -60,7 +60,7 @@ describe("broker", () => {
       heartbeatTimeoutMs: 2_000,
     });
     const base = `http://127.0.0.1:${broker.port}`;
-    const socket = await connectWorker(broker.port, "test-worker", ["echo.test"]);
+    const socket = await connectWorker(broker.port!, "test-worker", ["echo.test"]);
 
     const assignmentPromise = nextMessage(socket, "task.assign");
     const submittedResponse = await fetch(`${base}/tasks`, {
@@ -112,8 +112,8 @@ describe("broker", () => {
       heartbeatTimeoutMs: 2_000,
     });
     const base = `http://127.0.0.1:${broker.port}`;
-    const first = await connectWorker(broker.port, "render-a", ["render.segment.test"]);
-    const second = await connectWorker(broker.port, "render-b", ["render.segment.test"]);
+    const first = await connectWorker(broker.port!, "render-a", ["render.segment.test"]);
+    const second = await connectWorker(broker.port!, "render-b", ["render.segment.test"]);
 
     const streamResponse = await fetch(`${base}/streams`, {
       method: "POST",
@@ -170,7 +170,7 @@ describe("broker", () => {
       heartbeatTimeoutMs: 2_000,
     });
     const base = `http://127.0.0.1:${broker.port}`;
-    const socket = await connectWorker(broker.port, "render-a", ["render.segment.test"]);
+    const socket = await connectWorker(broker.port!, "render-a", ["render.segment.test"]);
 
     const stream = await fetch(`${base}/streams`, {
       method: "POST",
