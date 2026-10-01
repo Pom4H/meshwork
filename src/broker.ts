@@ -650,7 +650,11 @@ export function startBroker(options: number | BrokerOptions = 8787) {
     const now = Date.now();
 
     for (const [workerId, worker] of workers) {
-      if (now - worker.lastSeenAt <= heartbeatTimeoutMs) continue;
+      if (now - worker.lastSeenAt <= heartbeatTimeoutMs) {
+        // A server-driven heartbeat does not depend on background page timers.
+        send(worker, { type: 'worker.ping' });
+        continue;
+      }
       if (worker.taskId) {
         const state = tasks.get(worker.taskId);
         if (state?.status === "running") requeue(state);
@@ -788,6 +792,7 @@ export function startBroker(options: number | BrokerOptions = 8787) {
 
         const webModules: Record<string, string> = {
           "/render-video.js": "../web/render-video.js",
+          "/worker-connection.js": "../web/worker-connection.js",
           "/player.js": "../web/player.js",
           "/live-scene.js": "../web/live-scene.js",
           "/live-chat.js": "../web/live-chat.js",
@@ -1761,11 +1766,13 @@ export function startBroker(options: number | BrokerOptions = 8787) {
           schedule();
         }
       },
-      close: (socket) => {
+      close: (socket, code, reason) => {
         const workerId = socket.data.workerId;
         if (!workerId) return;
         const worker = workers.get(workerId);
         if (!worker || worker.socket !== socket) return;
+        console.log(JSON.stringify({event:'worker.disconnected',workerId,
+          code,reason,heartbeatAgeMs:Date.now()-worker.lastSeenAt,time:Date.now()}));
 
         if (worker.taskId) {
           const state = tasks.get(worker.taskId);

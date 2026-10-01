@@ -12,7 +12,17 @@ let cached;
 const check = (signal) => {
   if (signal.aborted) throw new DOMException("Task cancelled", "AbortError");
 };
-const yieldThread = () => new Promise((resolve) => setTimeout(resolve, 0));
+// Timer chains are throttled in background tabs. A posted task also lets
+// socket events and cancellation run while reconstructing a long timeline.
+const yieldThread = () => globalThis.scheduler?.yield
+  ? globalThis.scheduler.yield()
+  : new Promise((resolve) => {
+      const channel = new MessageChannel();
+      channel.port1.onmessage = () => {
+        channel.port1.close(); channel.port2.close(); resolve();
+      };
+      channel.port2.postMessage(null);
+    });
 
 function encodingOptions(width, height, fps, hardwareAcceleration) {
   return {
@@ -105,17 +115,20 @@ async function sceneRuntime(input, canvas, signal) {
 }
 
 /** Deterministic absolute simulation time; yield during replay to renew leases. */
-async function advance(runtime, frame, fps, signal, capture) {
+async function advance(runtime, frame, fps, signal, capture, activity = () => {}) {
   const target = Math.round((frame / fps) * runtime.tickRate);
   if (runtime.scene.tick > target)
     throw Error("Simulation timeline moved backwards without reset");
   while (runtime.scene.tick < target) {
     check(signal);
+    const sliceStart = performance.now();
     for (let n = 0; n < 120 && runtime.scene.tick < target; n++) {
       runtime.scene.step(runtime.stepSeconds);
       runtime.scene.drainEvents();
       runtime.scene.contacts.drainFootsteps();
+      if (performance.now() - sliceStart >= 8) break;
     }
+    activity(`replaying simulation ${runtime.scene.tick}/${target}`);
     await yieldThread();
   }
   runtime.renderer.setTimelineFrame(frame);
@@ -123,6 +136,7 @@ async function advance(runtime, frame, fps, signal, capture) {
   runtime.render();
   capture?.();
   await runtime.drain();
+  activity(`rendering source frame ${frame}`);
   check(signal);
 }
 
@@ -131,12 +145,14 @@ export async function renderVideoSegment(
   canvas,
   signal,
   progress = () => {},
+  activity = () => {},
 ) {
   let stage = "validate segment";
   try {
     return await encodeSegment(input, canvas, signal, progress, (value) => {
       stage = value;
-    });
+      activity(value);
+    }, activity);
   } catch (error) {
     // A failed GPU/encoder must not poison every subsequent assignment.
     cached?.runtime.dispose();
@@ -146,7 +162,7 @@ export async function renderVideoSegment(
   }
 }
 
-async function encodeSegment(input, canvas, signal, progress, reportStage) {
+async function encodeSegment(input, canvas, signal, progress, reportStage, activity) {
   if (input.snapshotHash)
     throw Error("Snapshot restore is unavailable; use deterministic replay");
   if (
@@ -183,7 +199,7 @@ async function encodeSegment(input, canvas, signal, progress, reportStage) {
       await runtime.replaceScene(cache.spec);
     check(signal);
     runtime.renderer.resetTemporalHistory();
-    await advance(runtime, input.warmupStartFrame, input.fps, signal);
+    await advance(runtime, input.warmupStartFrame, input.fps, signal, undefined, activity);
     // Initial range also needs a full convergence warmup even when there is no
     // earlier source timeline. Repeated t=0 frames are never published.
     for (
@@ -193,6 +209,7 @@ async function encodeSegment(input, canvas, signal, progress, reportStage) {
     ) {
       runtime.render();
       await runtime.drain();
+      activity(`warmup ${n + 1}/${input.warmupFrames}`);
       check(signal);
     }
     for (
@@ -200,7 +217,7 @@ async function encodeSegment(input, canvas, signal, progress, reportStage) {
       frame < input.startFrame;
       frame++
     )
-      await advance(runtime, frame, input.fps, signal);
+      await advance(runtime, frame, input.fps, signal, undefined, activity);
   }
   let encodedFrames = 0,
     encoderConfig;
@@ -237,7 +254,7 @@ async function encodeSegment(input, canvas, signal, progress, reportStage) {
       reportStage(`render / encode frame ${n + 1}/${input.frameCount}`);
       const frame = input.startFrame + n;
       await advance(runtime, frame, input.fps, signal, () =>
-        encodeContext.drawImage(canvas, 0, 0),
+        encodeContext.drawImage(canvas, 0, 0), activity,
       );
       // Absolute PTS survives independently created muxers and out-of-order
       // completion. Frame 0 of each segment is independently decodable.

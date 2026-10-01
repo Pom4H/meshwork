@@ -114,6 +114,7 @@ export type WorkerToBroker =
     };
 
 export type BrokerToWorker =
+  | { type: 'worker.ping' }
   | ({ type: "task.assign" } & TaskAssignment)
   | { type: "task.cancel"; taskId: string; attemptId: string }
   | ({ type: "shard.assign" } & ShardAssignment)

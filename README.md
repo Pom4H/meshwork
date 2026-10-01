@@ -103,3 +103,12 @@ bun tools/qa-video.ts snowy-arcade-fidelity 3840
 ```
 
 The integration harness requires native Chrome, `ffprobe`, and `ffmpeg` (override `CHROME_PATH`, `FFPROBE_PATH`, `FFMPEG_PATH` if needed). It creates two isolated browser workers with a real GPU, renders two actual scene segments, checks decoded pixel variation, frame counts, 4K dimensions and absolute timestamps, then plays their combined HLS stream. Evidence, decoded previews and a player screenshot are saved under `artifacts/qa-video/`. This validates the desktop path; physical iPad compatibility and sustained throughput require testing on the actual devices.
+## Browser worker recovery
+
+Browser workers answer broker-driven heartbeat requests as well as their own
+timer. Timeline replay yields in short slices and reports progress, including
+during warmup. Transient disconnects automatically retry with a 1–30 second
+backoff; returning to the tab or restoring network connectivity retries sooner.
+The last close code and reason stay visible after recovery. Invalid protocol or
+authorization responses stop automatic retries. A suspended device still cannot
+render until the browser resumes it.

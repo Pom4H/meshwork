@@ -8,7 +8,7 @@ function moduleWith(canEncodeVideo: (codec: string, options: any) => Promise<boo
     .replace(/import \{applyLiveScene\} from '\/live-scene.js';/, 'const applyLiveScene=()=>{};')
     .replace(/export async function/g, "async function");
   class Quality { constructor(public options: any) {} }
-  return new Function("dependencies", body + "\nreturn { videoCodecs, renderVideoSegment };")({ Quality, canEncodeVideo });
+  return new Function("dependencies", body + "\nreturn { videoCodecs, renderVideoSegment, advance };")({ Quality, canEncodeVideo });
 }
 
 test("advertise 720p codecs with hardware preference fallback and matching realtime settings", async () => {
@@ -30,6 +30,23 @@ test("advertise 720p codecs with hardware preference fallback and matching realt
       expect(call.quality.options.bitrate).toBe(6635520);
     }
   } finally { (globalThis as any).VideoEncoder = previous; }
+});
+
+test('long timeline replay yields to socket events and reports cancellable progress',async()=>{
+  const module=moduleWith(async()=>true);
+  const controller=new AbortController();
+  const channel=new MessageChannel();
+  channel.port1.onmessage=()=>controller.abort();
+  let slices=0, rendered=false;
+  const runtime={tickRate:60,stepSeconds:1/60,scene:{tick:0,step(){this.tick++;},drainEvents(){},contacts:{drainFootsteps(){}}},
+    renderer:{setTimelineFrame(){}},render(){rendered=true;},async drain(){}};
+  await expect(module.advance(runtime,10000,60,controller.signal,undefined,()=>{
+    slices++;if(slices===3)channel.port2.postMessage(null);
+  })).rejects.toThrow('Task cancelled');
+  expect(slices).toBeGreaterThanOrEqual(3);
+  expect(runtime.scene.tick).toBeLessThan(10000);
+  expect(rendered).toBe(false);
+  channel.port1.close();channel.port2.close();
 });
 
 test("unsupported actual task codec reports dimensions and failure stage before loading GPU", async () => {

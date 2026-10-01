@@ -61,6 +61,24 @@ function nextMessage<T extends BrokerToWorker["type"]>(
 }
 
 describe("broker", () => {
+  test('server-driven heartbeat keeps a busy attempt leased without client timers',async()=>{
+    broker=startBroker({port:0,artifactDir,leaseMs:1600,heartbeatTimeoutMs:1600});
+    const base=`http://127.0.0.1:${broker.port}`;
+    const socket=await connectWorker(broker.port!,'no-timers',['echo.test']);
+    let active:any,pings=0;
+    socket.addEventListener('message',event=>{
+      const m=JSON.parse(String(event.data));
+      if(m.type==='task.assign')active=m;
+      if(m.type==='worker.ping'){
+        pings++;socket.send(JSON.stringify({type:'worker.heartbeat',workerId:'no-timers',taskId:active?.task.id,attemptId:active?.attemptId}));
+      }
+    });
+    const task=await fetch(base+'/tasks',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({capability:'echo.test',input:{}})}).then(r=>r.json() as Promise<TaskState>);
+    await Bun.sleep(3300);
+    const state=await fetch(base+'/tasks/'+task.task.id).then(r=>r.json() as Promise<TaskState>);
+    expect(pings).toBeGreaterThanOrEqual(2);expect(state.status).toBe('running');expect(state.attempts).toBe(1);
+    socket.close();
+  });
   test("a leased shard holds its worker until revoked before ordinary work can run", async () => {
     broker = startBroker({ port: 0, artifactDir });
     const base = `http://127.0.0.1:${broker.port}`;

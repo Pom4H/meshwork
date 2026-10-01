@@ -86,6 +86,12 @@ export function startWorker(options: WorkerOptions = {}) {
         return;
       }
 
+      if (message.type === 'worker.ping') {
+        send({ type: 'worker.heartbeat', workerId: worker.id,
+          taskId: active?.taskId, attemptId: active?.attemptId });
+        return;
+      }
+
       if (message.type === "task.cancel") {
         if (
           active?.taskId === message.taskId &&

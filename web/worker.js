@@ -5,22 +5,27 @@ errorEl.id = "last-error";
 errorEl.hidden = true;
 errorEl.style.borderColor = "#b74c4c";
 logEl.before(errorEl);
+const connectionEl = document.createElement('pre');
+connectionEl.id = 'last-disconnect';
+connectionEl.hidden = true;
+logEl.before(connectionEl);
 const showError = (error) => {
   errorEl.hidden = false;
   errorEl.textContent = `Last error (${new Date().toLocaleTimeString()}):\n${error instanceof Error ? error.stack || error.message : String(error)}\n${navigator.userAgent}`;
 };
 const startButton = document.querySelector("#start");
 const nameInput = document.querySelector("#name");
+nameInput.value = localStorage.meshworkWorkerName || nameInput.value;
 const canvas = document.querySelector("#preview");
 const preview = canvas.getContext("2d");
 import { renderVideoSegment, videoCodecs } from "./render-video.js";
+import { workerConnection } from "./worker-connection.js";
 const engineCanvas = document.createElement("canvas");
 engineCanvas.hidden = true;
 canvas.before(engineCanvas);
 let renderQueue = Promise.resolve();
 
 let socket;
-let heartbeat;
 let wakeLock;
 let device;
 let pipeline;
@@ -60,7 +65,7 @@ async function ensureGpu() {
     setState("GPU lost");
     log(`GPU device lost: ${info.message || info.reason}`);
     showError(`GPU device lost: ${info.message || info.reason}`);
-    socket?.close();
+    socket?.reconnect();
   });
 
   return device;
@@ -243,9 +248,7 @@ async function uploadArtifact(taskId, attemptId, blob) {
 }
 
 function send(message) {
-  if (socket?.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify(message));
-  }
+  return socket?.send(message);
 }
 
 async function handleAssignment(message) {
@@ -278,6 +281,11 @@ async function executeAssignment(message, job) {
           engineCanvas,
           job.controller.signal,
           (n, total) => setState(`rendering ${n}/${total}`),
+          (stage) => {
+            if (active !== job || job.controller.signal.aborted) return;
+            socket?.heartbeat();
+            setState(stage);
+          },
         )
       : await renderFrame(message.task.input);
     if (active !== job || job.controller.signal.aborted) return;
@@ -340,6 +348,10 @@ async function requestWakeLock() {
 }
 
 async function start() {
+  localStorage.meshworkWorkerName = nameInput.value.trim();
+  active?.controller.abort();
+  active = undefined;
+  socket?.stop();
   startButton.disabled = true;
   setState("initializing GPU");
 
@@ -352,10 +364,9 @@ async function start() {
     await requestWakeLock();
     const codecs = await videoCodecs();
 
-    socket = new WebSocket(wsUrl);
-    socket.addEventListener("open", () => {
-      setState("ready");
-      send({
+    socket = workerConnection({
+      url: wsUrl,
+      hello: () => ({
         type: "worker.hello",
         worker: {
           id: workerId,
@@ -368,23 +379,20 @@ async function start() {
           ],
           videoCodecs: codecs,
         },
-      });
-
-      heartbeat = setInterval(() => {
-        send({
+      }),
+      heartbeat: () => ({
           type: "worker.heartbeat",
           workerId,
           taskId: active?.taskId,
           attemptId: active?.attemptId,
-        });
-      }, 5_000);
-
+      }),
+      onOpen: () => {
+      setState("ready");
       log(
         `Connected. Video codecs (720p60 probe): ${codecs.join(", ") || "none"}. Waiting for tasks.`,
       );
-    });
-
-    socket.addEventListener("message", (event) => {
+      },
+      onMessage: (event) => {
       let message;
       try {
         message = JSON.parse(String(event.data));
@@ -392,7 +400,9 @@ async function start() {
         return;
       }
 
-      if (message.type === "task.assign") {
+      if (message.type === 'worker.ping') {
+        socket?.heartbeat(true);
+      } else if (message.type === "task.assign") {
         void handleAssignment(message);
       } else if (
         message.type === "task.cancel" &&
@@ -402,15 +412,16 @@ async function start() {
         active.controller.abort();
         setState("cancelling");
       }
-    });
-
-    socket.addEventListener("close", () => {
-      clearInterval(heartbeat);
-      heartbeat = undefined;
+      },
+      onDisconnect: (event) => {
       active?.controller.abort();
       active = undefined;
       setState("disconnected");
-      startButton.disabled = false;
+      connectionEl.hidden = false;
+      connectionEl.textContent = `Last disconnect (${new Date().toLocaleTimeString()}): ${event.code} ${event.reason || '(no reason)'}`;
+      },
+      onRetry: delay => setState(`reconnecting in ${delay / 1000}s`),
+      onFatal: () => { setState('connection rejected'); startButton.disabled = false; },
     });
   } catch (error) {
     showError(error);
@@ -421,13 +432,12 @@ async function start() {
 }
 
 document.addEventListener("visibilitychange", () => {
-  if (
-    document.visibilityState === "visible" &&
-    socket?.readyState === WebSocket.OPEN
-  ) {
+  if (document.visibilityState === "visible") {
+    socket?.resume();
     void requestWakeLock();
   }
 });
+window.addEventListener('online', () => socket?.resume());
 
 startButton.addEventListener("click", () => void start());
 startButton.disabled = false;
