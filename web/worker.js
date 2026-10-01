@@ -1,12 +1,31 @@
 const stateEl = document.querySelector("#state");
 const logEl = document.querySelector("#log");
+const errorEl = document.createElement("pre");
+errorEl.id = "last-error";
+errorEl.hidden = true;
+errorEl.style.borderColor = "#b74c4c";
+logEl.before(errorEl);
+const connectionEl = document.createElement('pre');
+connectionEl.id = 'last-disconnect';
+connectionEl.hidden = true;
+logEl.before(connectionEl);
+const showError = (error) => {
+  errorEl.hidden = false;
+  errorEl.textContent = `Last error (${new Date().toLocaleTimeString()}):\n${error instanceof Error ? error.stack || error.message : String(error)}\n${navigator.userAgent}`;
+};
 const startButton = document.querySelector("#start");
 const nameInput = document.querySelector("#name");
+nameInput.value = localStorage.meshworkWorkerName || nameInput.value;
 const canvas = document.querySelector("#preview");
 const preview = canvas.getContext("2d");
+import { renderVideoSegment, videoCodecs } from "./render-video.js";
+import { workerConnection } from "./worker-connection.js";
+const engineCanvas = document.createElement("canvas");
+engineCanvas.hidden = true;
+canvas.before(engineCanvas);
+let renderQueue = Promise.resolve();
 
 let socket;
-let heartbeat;
 let wakeLock;
 let device;
 let pipeline;
@@ -28,7 +47,9 @@ wsUrl.protocol = location.protocol === "https:" ? "wss:" : "ws:";
 
 async function ensureGpu() {
   if (!globalThis.navigator.gpu) {
-    throw new Error("WebGPU is not available. Use iPadOS 26+ Safari over HTTPS.");
+    throw new Error(
+      "WebGPU is not available. Use iPadOS 26+ Safari over HTTPS.",
+    );
   }
   if (device) return device;
 
@@ -43,7 +64,8 @@ async function ensureGpu() {
     pipeline = undefined;
     setState("GPU lost");
     log(`GPU device lost: ${info.message || info.reason}`);
-    socket?.close();
+    showError(`GPU device lost: ${info.message || info.reason}`);
+    socket?.reconnect();
   });
 
   return device;
@@ -106,9 +128,16 @@ function ensurePipeline(gpu) {
 }
 
 function taskInput(value) {
-  const input = value && typeof value === "object" && !Array.isArray(value) ? value : {};
-  const width = Math.min(4096, Math.max(1, Math.floor(Number(input.width) || 1280)));
-  const height = Math.min(4096, Math.max(1, Math.floor(Number(input.height) || 720)));
+  const input =
+    value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const width = Math.min(
+    4096,
+    Math.max(1, Math.floor(Number(input.width) || 1280)),
+  );
+  const height = Math.min(
+    4096,
+    Math.max(1, Math.floor(Number(input.height) || 720)),
+  );
   const seed = Number.isFinite(Number(input.seed)) ? Number(input.seed) : 0;
   return { width, height, seed };
 }
@@ -147,12 +176,14 @@ async function renderFrame(input) {
 
   const encoder = gpu.createCommandEncoder();
   const pass = encoder.beginRenderPass({
-    colorAttachments: [{
-      view: texture.createView(),
-      clearValue: { r: 0, g: 0, b: 0, a: 1 },
-      loadOp: "clear",
-      storeOp: "store",
-    }],
+    colorAttachments: [
+      {
+        view: texture.createView(),
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        loadOp: "clear",
+        storeOp: "store",
+      },
+    ],
   });
   pass.setPipeline(renderPipeline);
   pass.setBindGroup(0, bindGroup);
@@ -171,7 +202,10 @@ async function renderFrame(input) {
   const mapped = new Uint8Array(readback.getMappedRange());
   const pixels = new Uint8ClampedArray(unpaddedBytesPerRow * height);
   for (let y = 0; y < height; y += 1) {
-    const source = mapped.subarray(y * bytesPerRow, y * bytesPerRow + unpaddedBytesPerRow);
+    const source = mapped.subarray(
+      y * bytesPerRow,
+      y * bytesPerRow + unpaddedBytesPerRow,
+    );
     pixels.set(source, y * unpaddedBytesPerRow);
   }
 
@@ -185,7 +219,11 @@ async function renderFrame(input) {
   preview.putImageData(new ImageData(pixels, width, height), 0, 0);
 
   const blob = await new Promise((resolve, reject) => {
-    canvas.toBlob((value) => value ? resolve(value) : reject(new Error("PNG encode failed")), "image/png");
+    canvas.toBlob(
+      (value) =>
+        value ? resolve(value) : reject(new Error("PNG encode failed")),
+      "image/png",
+    );
   });
 
   return {
@@ -201,7 +239,7 @@ async function uploadArtifact(taskId, attemptId, blob) {
     `/artifacts/${encodeURIComponent(taskId)}/${encodeURIComponent(attemptId)}`,
     {
       method: "POST",
-      headers: { "content-type": "image/png" },
+      headers: { "content-type": blob.type },
       body: blob,
     },
   );
@@ -210,24 +248,47 @@ async function uploadArtifact(taskId, attemptId, blob) {
 }
 
 function send(message) {
-  if (socket?.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify(message));
-  }
+  return socket?.send(message);
 }
 
 async function handleAssignment(message) {
-  if (active) return;
-  active = { taskId: message.task.id, attemptId: message.attemptId };
+  active?.controller.abort();
+  const job = {
+    taskId: message.task.id,
+    attemptId: message.attemptId,
+    controller: new AbortController(),
+  };
+  active = job;
+  renderQueue = renderQueue
+    .catch(() => {})
+    .then(() => executeAssignment(message, job));
+}
+
+async function executeAssignment(message, job) {
+  if (job.controller.signal.aborted) return;
   setState("rendering");
-  log(`Rendering ${message.task.id}\n${JSON.stringify(message.task.input, null, 2)}`);
+  log(
+    `Rendering ${message.task.id}\n${JSON.stringify(message.task.input, null, 2)}`,
+  );
 
   try {
-    const result = await renderFrame(message.task.input);
-    if (
-      !active ||
-      active.taskId !== message.task.id ||
-      active.attemptId !== message.attemptId
-    ) return;
+    const video = message.task.capability === "render.video.segment.v1";
+    engineCanvas.hidden = !video;
+    canvas.hidden = video;
+    const result = video
+      ? await renderVideoSegment(
+          message.task.input,
+          engineCanvas,
+          job.controller.signal,
+          (n, total) => setState(`rendering ${n}/${total}`),
+          (stage) => {
+            if (active !== job || job.controller.signal.aborted) return;
+            socket?.heartbeat();
+            setState(stage);
+          },
+        )
+      : await renderFrame(message.task.input);
+    if (active !== job || job.controller.signal.aborted) return;
 
     setState("uploading");
     const artifact = await uploadArtifact(
@@ -235,6 +296,7 @@ async function handleAssignment(message) {
       message.attemptId,
       result.blob,
     );
+    if (active !== job || job.controller.signal.aborted) return;
 
     send({
       type: "task.result",
@@ -245,12 +307,25 @@ async function handleAssignment(message) {
         width: result.width,
         height: result.height,
         renderMs: result.renderMs,
+        ...(video
+          ? {
+              frameCount: result.frameCount,
+              startFrame: result.startFrame,
+              mimeType: result.mimeType,
+              encoder: result.encoder,
+              renderer: result.renderer,
+            }
+          : {}),
         userAgent: navigator.userAgent,
       },
     });
     setState("ready");
-    log(`Completed ${message.task.id}\n${result.width}×${result.height} in ${result.renderMs.toFixed(1)} ms\n${artifact.url}`);
+    log(
+      `Completed ${message.task.id}\n${result.width}×${result.height} in ${result.renderMs.toFixed(1)} ms\n${artifact.url}`,
+    );
   } catch (error) {
+    if (active !== job || job.controller.signal.aborted) return;
+    showError(error);
     send({
       type: "task.error",
       taskId: message.task.id,
@@ -260,7 +335,7 @@ async function handleAssignment(message) {
     setState("error");
     log(error instanceof Error ? error.stack || error.message : String(error));
   } finally {
-    active = undefined;
+    if (active === job) active = undefined;
   }
 }
 
@@ -273,39 +348,51 @@ async function requestWakeLock() {
 }
 
 async function start() {
+  localStorage.meshworkWorkerName = nameInput.value.trim();
+  active?.controller.abort();
+  active = undefined;
+  socket?.stop();
   startButton.disabled = true;
   setState("initializing GPU");
 
   try {
-    await ensureGpu();
+    // The scene runtime owns its GPU device. Allocate the demo frame device
+    // lazily only if a render.webgpu.frame.v1 task actually arrives.
+    if (!navigator.gpu) throw Error("WebGPU is unavailable in this browser");
+    if (!await navigator.gpu.requestAdapter({ powerPreference: "high-performance" }))
+      throw Error("No WebGPU adapter");
     await requestWakeLock();
+    const codecs = await videoCodecs();
 
-    socket = new WebSocket(wsUrl);
-    socket.addEventListener("open", () => {
-      setState("ready");
-      send({
+    socket = workerConnection({
+      url: wsUrl,
+      hello: () => ({
         type: "worker.hello",
         worker: {
           id: workerId,
           name: nameInput.value.trim() || "iPad WebGPU",
           platform: navigator.platform || "browser",
-          capabilities: ["render.webgpu.frame.v1"],
+          capabilities: [
+            "render.webgpu.frame.v1",
+            'scene.live-controls.v1',
+            ...(codecs.length ? ["render.video.segment.v1"] : []),
+          ],
+          videoCodecs: codecs,
         },
-      });
-
-      heartbeat = setInterval(() => {
-        send({
+      }),
+      heartbeat: () => ({
           type: "worker.heartbeat",
           workerId,
           taskId: active?.taskId,
           attemptId: active?.attemptId,
-        });
-      }, 5_000);
-
-      log("Connected. Waiting for render.webgpu.frame.v1 tasks.");
-    });
-
-    socket.addEventListener("message", (event) => {
+      }),
+      onOpen: () => {
+      setState("ready");
+      log(
+        `Connected. Video codecs (720p60 probe): ${codecs.join(", ") || "none"}. Waiting for tasks.`,
+      );
+      },
+      onMessage: (event) => {
       let message;
       try {
         message = JSON.parse(String(event.data));
@@ -313,26 +400,31 @@ async function start() {
         return;
       }
 
-      if (message.type === "task.assign") {
+      if (message.type === 'worker.ping') {
+        socket?.heartbeat(true);
+      } else if (message.type === "task.assign") {
         void handleAssignment(message);
       } else if (
         message.type === "task.cancel" &&
         active?.taskId === message.taskId &&
         active?.attemptId === message.attemptId
       ) {
-        active = undefined;
-        setState("ready");
+        active.controller.abort();
+        setState("cancelling");
       }
-    });
-
-    socket.addEventListener("close", () => {
-      clearInterval(heartbeat);
-      heartbeat = undefined;
+      },
+      onDisconnect: (event) => {
+      active?.controller.abort();
       active = undefined;
       setState("disconnected");
-      startButton.disabled = false;
+      connectionEl.hidden = false;
+      connectionEl.textContent = `Last disconnect (${new Date().toLocaleTimeString()}): ${event.code} ${event.reason || '(no reason)'}`;
+      },
+      onRetry: delay => setState(`reconnecting in ${delay / 1000}s`),
+      onFatal: () => { setState('connection rejected'); startButton.disabled = false; },
     });
   } catch (error) {
+    showError(error);
     setState("error");
     log(error instanceof Error ? error.stack || error.message : String(error));
     startButton.disabled = false;
@@ -340,9 +432,12 @@ async function start() {
 }
 
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible" && socket?.readyState === WebSocket.OPEN) {
+  if (document.visibilityState === "visible") {
+    socket?.resume();
     void requestWakeLock();
   }
 });
+window.addEventListener('online', () => socket?.resume());
 
 startButton.addEventListener("click", () => void start());
+startButton.disabled = false;

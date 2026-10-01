@@ -13,5 +13,9 @@
   "devDependencies": {
     "@types/bun": "latest",
     "typescript": "latest"
+  },
+  "dependencies": {
+    "hls.js": "^1.7.3",
+    "mediabunny": "^1.61.0"
   }
 }

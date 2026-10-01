@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width,initial-scale=1,viewport-fit=cover"
+    />
+    <title>Meshwork · Live stream</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: #090d11;
+        color: #eee;
+        font: 16px system-ui;
+      }
+      main {
+        height: 100dvh;
+        display: flex;
+        flex-direction: column;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        padding: 14px 20px;
+        flex-wrap: wrap;
+      }
+      a {
+        color: #b9d9ff;
+      }
+      video {
+        width: 100%;
+        min-height: 0;
+        flex: 1;
+        background: #000;
+        object-fit: contain;
+      }
+      span {
+        color: #a4b0bc;
+      }
+      button {font:inherit;background:#253647;color:#fff;border:1px solid #536b80;border-radius:8px;padding:8px 12px;cursor:pointer;}
+      #error {
+        color: #ffb6a8;
+        padding: 0 20px;
+      }
+      .view {display:grid;grid-template-columns:minmax(0,1fr) 340px;flex:1;min-height:0;}
+      .stage {position:relative;display:flex;min-height:0;overflow:hidden;}
+      .chat {display:flex;flex-direction:column;min-height:0;background:#111a22;border-left:1px solid #293744;padding:14px;gap:12px;}
+      .chat h2 {font-size:16px;margin:0;}
+      #messages {list-style:none;padding:0;margin:0;overflow:auto;flex:1;font-size:14px;line-height:1.45;}
+      #messages li {padding:10px 0;border-bottom:1px solid #25303a;overflow-wrap:anywhere;}
+      #messages strong {color:#bac8d5;} #messages .codex strong {color:#86d8bd;}
+      #messages p {margin:4px 0;white-space:pre-wrap;}
+      #messages small,#agent {color:#8eabba;font-size:12px;}
+      #reactions {display:flex;gap:5px;} #reactions button {padding:6px;flex:1;font-size:16px;}
+      #reactions span {font-size:11px;display:block;}
+      form {display:grid;grid-template-columns:1fr auto;gap:8px;}
+      input {font:inherit;background:#0b1219;color:#eee;border:1px solid #3a5064;border-radius:7px;padding:9px;min-width:0;}
+      #name {grid-column:1/-1;font-size:13px;} #chat-error {color:#ffb6a8;font-size:12px;}
+      .reaction {position:absolute;bottom:70px;left:80%;font-size:34px;pointer-events:none;animation:float 1.8s ease-out forwards;}
+      @keyframes float {to{transform:translate(-40px,-180px) rotate(15deg);opacity:0;}}
+      @media(max-width:800px){header{padding:10px;gap:10px;font-size:13px;}.view{display:flex;flex-direction:column;}.stage{flex:1;min-height:180px;}.chat{height:34dvh;min-height:200px;border-left:0;border-top:1px solid #293744;padding:10px;gap:6px;}#name{display:none;}#reactions button{font-size:15px;padding:3px;}#reactions span{display:inline;margin-left:5px;}.chat h2{display:none;}}
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <strong>Meshwork · LIVE</strong
+        ><span id="state">Ожидание iPad-воркеров…</span
+        ><a id="worker" href="/">Подключить iPad</a>
+        <button id="sound" type="button" aria-pressed="false">Включить звук</button>
+      </header>
+      <div id="error" role="alert"></div>
+      <section class="view">
+        <div class="stage"><video controls autoplay muted playsinline></video></div>
+        <aside class="chat" aria-label="Чат трансляции">
+          <h2>Чат сцены</h2>
+          <div id="reactions" aria-label="Реакции">
+            <button type="button" data-emoji="❤️" aria-label="Сердце">❤️ <span>0</span></button>
+            <button type="button" data-emoji="🔥" aria-label="Огонь">🔥 <span>0</span></button>
+            <button type="button" data-emoji="👏" aria-label="Аплодисменты">👏 <span>0</span></button>
+            <button type="button" data-emoji="❄️" aria-label="Снег">❄️ <span>0</span></button>
+            <button type="button" data-emoji="🐎" aria-label="Лошадь">🐎 <span>0</span></button>
+          </div>
+          <ol id="messages" aria-live="polite" aria-relevant="additions"></ol>
+          <div id="agent">Подключение к чату…</div>
+          <form id="chat-form">
+            <input id="name" aria-label="Имя" placeholder="Твоё имя" maxlength="40" />
+            <input id="message" aria-label="Пожелание к сцене" placeholder="Пожелание к сцене…" maxlength="1000" required autocomplete="off" />
+            <button type="submit" aria-label="Отправить сообщение">↑</button>
+          </form>
+          <div id="chat-error" role="alert"></div>
+        </aside>
+      </section>
+    </main>
+    <script type="module" src="/player.js"></script>
+    <script type="module" src="/live-chat.js"></script>
+  </body>
+</html>
